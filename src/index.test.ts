@@ -111,6 +111,17 @@ describe("createOverlay", () => {
     }
   });
 
+  test("a GET overlay handles HEAD requests", async () => {
+    const overlay = createOverlay();
+    const app = new Hono().use(overlay).get("/test", (c) => c.text("original"));
+
+    using _ = overlay.get("/test", (c) => c.text("overlay", 202));
+
+    const res = await app.request("/test", { method: "HEAD" });
+    expect(res.status).toBe(202);
+    expect(await res.text()).toBe("");
+  });
+
   test("keeps other overlay routes after disposing one of them", async () => {
     const overlay = createOverlay();
     const app = new Hono()
@@ -258,21 +269,215 @@ describe("createOverlay", () => {
     expect(await res.text()).toBe("overlay:hono");
   });
 
-  test("runs multiple overlay handlers in order", async () => {
+  test("passes the original context directly to the overlay handler", async () => {
     const overlay = createOverlay();
-    const app = new Hono().use(overlay).get("/test", (c) => c.json({ source: "original" }));
-
-    using _ = overlay.get(
-      "/test",
-      async (c, next) => {
-        c.header("X-Overlay", "1");
+    let originalContext: unknown;
+    const app = new Hono()
+      .use("*", async (c, next) => {
+        originalContext = c;
         await next();
-      },
-      (c) => c.json({ source: "overlay" }),
-    );
+      })
+      .use(overlay)
+      .get("/test", (c) => c.text("original"));
+
+    using _ = overlay.get("/test", (c) => c.text(c === originalContext ? "same" : "different"));
+
+    expect(await (await app.request("/test")).text()).toBe("same");
+  });
+
+  test("shares context variables with surrounding middleware", async () => {
+    type AppEnv = { Variables: { value: string } };
+    const overlay = createOverlay();
+    let valueAfterOverlay: string | undefined;
+    const app = new Hono<AppEnv>()
+      .use("*", async (c, next) => {
+        c.set("value", "before");
+        await next();
+        valueAfterOverlay = c.get("value");
+      })
+      .use(overlay)
+      .get("/test", (c) => c.text(c.get("value")));
+    const typedOverlay: OverlayMiddleware<typeof app> = overlay;
+
+    using _ = typedOverlay.get("/test", (c) => {
+      expect(c.get("value")).toBe("before");
+      c.set("value", "overlay");
+      return c.text(c.get("value"));
+    });
+
+    expect(await (await app.request("/test")).text()).toBe("overlay");
+    expect(valueAfterOverlay).toBe("overlay");
+  });
+
+  test("uses the renderer installed by surrounding middleware", async () => {
+    const overlay = createOverlay();
+    const app = new Hono()
+      .use("*", async (c, next) => {
+        c.setRenderer((content) => c.html(`<main>${content}</main>`));
+        await next();
+      })
+      .use(overlay)
+      .get("/test", (c) => c.text("original"));
+
+    using _ = overlay.get("/test", (c) => c.render("overlay"));
+
+    expect(await (await app.request("/test")).text()).toBe("<main>overlay</main>");
+  });
+
+  test("passes errors to the original app error handler", async () => {
+    const overlay = createOverlay();
+    const app = new Hono().use(overlay).get("/test", (c) => c.text("original"));
+    app.onError((error, c) => c.text(`handled:${error.message}`, 503));
+
+    using _ = overlay.get("/test", () => {
+      throw new Error("overlay error");
+    });
 
     const res = await app.request("/test");
-    expect(res.headers.get("X-Overlay")).toBe("1");
-    expect(await res.json()).toEqual({ source: "overlay" });
+    expect(res.status).toBe(503);
+    expect(await res.text()).toBe("handled:overlay error");
+  });
+
+  test("passes the execution context to overlay handlers", async () => {
+    const overlay = createOverlay();
+    const app = new Hono().use(overlay).get("/test", (c) => c.text("original"));
+    const executionContext = {
+      waitUntil: () => undefined,
+      passThroughOnException: () => undefined,
+      props: {},
+    };
+
+    using _ = overlay.get("/test", (c) =>
+      c.text(c.executionCtx === executionContext ? "same" : "different"),
+    );
+
+    expect(await (await app.request("/test", {}, undefined, executionContext)).text()).toBe("same");
+  });
+
+  test("can fall through to the original route with next", async () => {
+    const overlay = createOverlay();
+    const app = new Hono().use(overlay).get("/test", (c) => c.text("original", 201));
+
+    using _ = overlay.get("/test", async (c, next) => {
+      await next();
+      expect(c.res.status).toBe(201);
+      c.header("X-After", "overlay");
+    });
+
+    const res = await app.request("/test");
+    expect(res.status).toBe(201);
+    expect(res.headers.get("X-After")).toBe("overlay");
+    expect(await res.text()).toBe("original");
+  });
+
+  test("preserves validated request data and the request body cache", async () => {
+    const overlay = createOverlay();
+    const app = new Hono()
+      .use("/test", async (c, next) => {
+        const body = await c.req.json<{ message: string }>();
+        (c.req as any).addValidatedData("json", body);
+        await next();
+      })
+      .use(overlay)
+      .post("/test", (c) => c.text("original"));
+
+    using _ = overlay.post("/test", async (c) => {
+      const validated = (c.req as any).valid("json") as { message: string };
+      const body = await c.req.json<{ message: string }>();
+      return c.json({ validated, body });
+    });
+
+    const res = await app.request("/test", {
+      method: "POST",
+      body: JSON.stringify({ message: "hello" }),
+      headers: { "Content-Type": "application/json" },
+    });
+    expect(await res.json()).toEqual({
+      validated: { message: "hello" },
+      body: { message: "hello" },
+    });
+  });
+
+  test("uses parameters matched by the overlay route", async () => {
+    const overlay = createOverlay();
+    const app = new Hono()
+      .use(overlay)
+      .get("/users/:originalId", (c) => c.text(c.req.param("originalId")));
+
+    using _ = overlay.get("/users/:overlayId", (c) =>
+      c.json({
+        id: c.req.param("overlayId"),
+      }),
+    );
+
+    expect(await (await app.request("/users/42")).json()).toEqual({
+      id: "42",
+    });
+  });
+
+  test("inherits a static base path from the middleware route", async () => {
+    const overlayMiddleware = createOverlay();
+    const app = new Hono()
+      .basePath("/api")
+      .use(overlayMiddleware)
+      .get("/hello", (c) => c.text("original"));
+    const overlay: OverlayMiddleware<typeof app> = overlayMiddleware;
+
+    using _ = overlay.get("/hello", (c) => c.text("overlay"));
+
+    expect(await (await app.request("/api/hello")).text()).toBe("overlay");
+  });
+
+  test("inherits a parameterized base path from the middleware route", async () => {
+    const overlayMiddleware = createOverlay();
+    const app = new Hono()
+      .basePath("/api/:version")
+      .use(overlayMiddleware)
+      .get("/hello", (c) => c.text("original"));
+    const overlay: OverlayMiddleware<typeof app> = overlayMiddleware;
+
+    using _ = overlay.get("/hello", (c) => c.json({ version: c.req.param("version") }));
+
+    expect(await (await app.request("/api/v1/hello")).json()).toEqual({
+      version: "v1",
+    });
+  });
+
+  test("can mount the same overlay at different base paths", async () => {
+    const overlay = createOverlay();
+    const app = new Hono()
+      .use("/api/*", overlay)
+      .use("/admin/*", overlay)
+      .get("/api/hello", (c) => c.text("original api"))
+      .get("/admin/hello", (c) => c.text("original admin"));
+
+    using _ = overlay.get("/hello", (c) => c.text(`overlay:${c.req.path}`));
+
+    expect(await (await app.request("/api/hello")).text()).toBe("overlay:/api/hello");
+    expect(await (await app.request("/admin/hello")).text()).toBe("overlay:/admin/hello");
+    expect(await (await app.request("/api/hello")).text()).toBe("overlay:/api/hello");
+  });
+
+  test("uses the original app path normalization", async () => {
+    const overlay = createOverlay();
+    const app = new Hono({ strict: false }).use(overlay).get("/hello", (c) => c.text("original"));
+
+    using _ = overlay.get("/hello", (c) => c.text("overlay"));
+
+    expect(await (await app.request("/hello/")).text()).toBe("overlay");
+  });
+
+  test("uses the original app not-found handler after overlay next", async () => {
+    const overlay = createOverlay();
+    const app = new Hono().use(overlay);
+    app.notFound((c) => c.text("custom not found", 404));
+
+    using _ = overlay.get("/test", async (_c, next) => {
+      await next();
+    });
+
+    const res = await app.request("/test");
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe("custom not found");
   });
 });

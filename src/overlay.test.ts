@@ -1,82 +1,61 @@
 import { test, expect, describe } from "vitest";
+import { Hono } from "hono";
 import { Overlay } from "./overlay.js";
 
-const request = (path: string, init?: RequestInit) => new Request(`http://localhost${path}`, init);
+const createApp = (overlay: Overlay) =>
+  new Hono().use((context, next) => overlay.handle(context, next));
 
 describe("Overlay", () => {
-  test("hasRoute is false when no routes are registered", () => {
+  test("falls through when no routes are registered", async () => {
     const overlay = new Overlay();
-    expect(overlay.hasRoute(request("/test"))).toBe(false);
+    const app = createApp(overlay).get("/test", (c) => c.text("original"));
+
+    expect(await (await app.request("/test")).text()).toBe("original");
   });
 
-  test("hasRoute is true after addRoute and false after dispose", () => {
+  test("serves a route until it is disposed", async () => {
     const overlay = new Overlay();
-    const dispose = overlay.addRoute(["get", ["/test", (c: any) => c.json({ ok: true })]]);
+    const app = createApp(overlay).get("/test", (c) => c.text("original"));
+    const dispose = overlay.addRoute("get", "/test", (c: any) => c.text("overlay"));
 
-    expect(overlay.hasRoute(request("/test"))).toBe(true);
-    expect(overlay.hasRoute(request("/other"))).toBe(false);
-    expect(overlay.hasRoute(request("/test", { method: "POST" }))).toBe(false);
-
+    expect(await (await app.request("/test")).text()).toBe("overlay");
     dispose();
-    expect(overlay.hasRoute(request("/test"))).toBe(false);
+    expect(await (await app.request("/test")).text()).toBe("original");
   });
 
-  test("fetch serves the registered handler", async () => {
+  test("rebuilds after a request so later routes still work", async () => {
     const overlay = new Overlay();
-    using _ = overlay.addRoute(["get", ["/test", (c: any) => c.json({ source: "overlay" })]]);
+    const app = createApp(overlay);
 
-    const res = await overlay.fetch(request("/test"), {});
-    expect(await res.json()).toEqual({ source: "overlay" });
+    expect((await app.request("/a")).status).toBe(404);
+
+    using _a = overlay.addRoute("get", "/a", (c: any) => c.text("a"));
+    expect(await (await app.request("/a")).text()).toBe("a");
+
+    using _b = overlay.addRoute("get", "/b", (c: any) => c.text("b"));
+    expect(await (await app.request("/a")).text()).toBe("a");
+    expect(await (await app.request("/b")).text()).toBe("b");
   });
 
-  test("fetch 404s after the route is disposed", async () => {
+  test("keeps other routes after disposing one route", async () => {
     const overlay = new Overlay();
-    const dispose = overlay.addRoute(["get", ["/test", (c: any) => c.json({ ok: true })]]);
-
-    expect((await overlay.fetch(request("/test"), {})).status).toBe(200);
-    dispose();
-    expect((await overlay.fetch(request("/test"), {})).status).toBe(404);
-  });
-
-  test("rebuilds after a request so later addRoute still works", async () => {
-    const overlay = new Overlay();
-
-    expect(overlay.hasRoute(request("/a"))).toBe(false);
-
-    using _a = overlay.addRoute(["get", ["/a", (c: any) => c.json({ path: "a" })]]);
-    expect(await (await overlay.fetch(request("/a"), {})).json()).toEqual({ path: "a" });
-
-    using _b = overlay.addRoute(["get", ["/b", (c: any) => c.json({ path: "b" })]]);
-    expect(await (await overlay.fetch(request("/a"), {})).json()).toEqual({ path: "a" });
-    expect(await (await overlay.fetch(request("/b"), {})).json()).toEqual({ path: "b" });
-  });
-
-  test("keeps other routes after disposing one of them", async () => {
-    const overlay = new Overlay();
-    const disposeA = overlay.addRoute(["get", ["/a", (c: any) => c.json({ path: "a" })]]);
-    using _b = overlay.addRoute(["get", ["/b", (c: any) => c.json({ path: "b" })]]);
+    const app = createApp(overlay);
+    const disposeA = overlay.addRoute("get", "/a", (c: any) => c.text("a"));
+    using _b = overlay.addRoute("get", "/b", (c: any) => c.text("b"));
 
     disposeA();
 
-    expect(overlay.hasRoute(request("/a"))).toBe(false);
-    expect(overlay.hasRoute(request("/b"))).toBe(true);
-    expect(await (await overlay.fetch(request("/b"), {})).json()).toEqual({ path: "b" });
+    expect((await app.request("/a")).status).toBe(404);
+    expect(await (await app.request("/b")).text()).toBe("b");
   });
 
-  test("passes env bindings to handlers", async () => {
+  test("all() matches any method", async () => {
     const overlay = new Overlay();
-    using _ = overlay.addRoute(["get", ["/hello", (c: any) => c.text(c.env.name)]]);
+    const app = createApp(overlay);
+    using _ = overlay.addRoute("all", "/test", (c: any) => c.text(c.req.method));
 
-    const res = await overlay.fetch(request("/hello"), { name: "hono" });
-    expect(await res.text()).toBe("hono");
-  });
-
-  test("all() matches any method", () => {
-    const overlay = new Overlay();
-    using _ = overlay.addRoute(["all", ["/test", (c: any) => c.json({ ok: true })]]);
-
-    expect(overlay.hasRoute(request("/test"))).toBe(true);
-    expect(overlay.hasRoute(request("/test", { method: "POST" }))).toBe(true);
-    expect(overlay.hasRoute(request("/test", { method: "PUT" }))).toBe(true);
+    expect(await (await app.request("/test")).text()).toBe("GET");
+    expect(await (await app.request("/test", { method: "POST" })).text()).toBe("POST");
+    expect(await (await app.request("/test", { method: "PUT" })).text()).toBe("PUT");
   });
 });
