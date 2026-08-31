@@ -1,0 +1,7 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tsbuildinfo",
+    "target": "esnext",
+    "noEmit": true
+  }
+}

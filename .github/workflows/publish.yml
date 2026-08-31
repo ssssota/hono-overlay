@@ -1,0 +1,32 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  check:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup project
+        uses: ./.github/actions/setup
+
+      - name: Run check
+        run: pnpm check
+
+      - name: Run build
+        run: pnpm build
+
+      - name: Run test
+        run: pnpm test
+
+      - name: Publish
+        run: pnpm stage publish --provenance --access public --no-git-checks || echo "pnpm publish failed, skipping"
