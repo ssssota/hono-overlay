@@ -56,6 +56,10 @@ export class Overlay {
   }
 
   async handle(context: Context, next: Next): Promise<Response | void> {
+    if (this.#routes.size === 0) {
+      return await next();
+    }
+
     const basePath = basePathFromRoutePath(context.req.routePath);
     const router = this.#router(basePath);
     const method = context.req.method === "HEAD" ? "GET" : context.req.method;

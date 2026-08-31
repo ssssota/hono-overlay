@@ -16,9 +16,7 @@ import { Hono } from "hono";
 import { createOverlay, type OverlayMiddleware } from "hono-overlay";
 
 const overlayMiddleware = createOverlay();
-export const app = new Hono()
-  .use(overlayMiddleware)
-  .get("/hello", (c) => c.text("Hello"));
+export const app = new Hono().use(overlayMiddleware).get("/hello", (c) => c.text("Hello"));
 export const overlay: OverlayMiddleware<typeof app> = overlayMiddleware;
 
 // some.test.ts
